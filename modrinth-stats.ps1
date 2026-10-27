@@ -1,64 +1,62 @@
 ﻿# Config
-[CmdletBinding()]
-param (
-    [string[]]$Versions = @(
-        "1.20", "1.20.1", "1.20.2", "1.20.3", "1.20.4", "1.20.5", "1.20.6",
-        "1.21", "1.21.1", "1.21.2", "1.21.3", "1.21.4", "1.21.5", "1.21.6","1.21.7", "1.21.8", "1.21.9", "1.21.10", "1.21.11",
-        "26.1", "26.1.1", "26.1.2", "26.2"
-    ),
-
-    [string[]]$Loaders = @(
-        "forge", "fabric", "neoforge", "quilt"
-    ),
-
-    [int]$ValidHours = 48
+$Versions = @(
+	"1.20", "1.20.1", "1.20.2", "1.20.3", "1.20.4", "1.20.5", "1.20.6",
+	"1.21", "1.21.1", "1.21.2", "1.21.3", "1.21.4", "1.21.5", "1.21.6","1.21.7", "1.21.8", "1.21.9", "1.21.10", "1.21.11",
+	"26.1", "26.1.1", "26.1.2", "26.2"
 )
+$Loaders = @(
+	"forge", "fabric", "neoforge", "quilt"
+)
+$MaxCacheHours = 168 # -1 to always fetch
 
 # Initialization
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $Host.UI.RawUI.WindowTitle = "Modrinth Stats"
 $ProgressPreference = 'SilentlyContinue'
-$CachePath = Join-Path -Path $env:USERPROFILE -ChildPath "modrinth-stats-cache.json"
-$LastWriteTime = [datetime]::MinValue
-$Data = $null
 
 # Read local cache.
+$CachePath = Join-Path -Path $env:USERPROFILE -ChildPath "modrinth-stats-cache.json"
+$Cache = $null
+$LastWriteTime = [datetime]::MinValue
 if (Test-Path -Path $CachePath) {
 	try {
-		$Data = Get-Content -Path $CachePath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+		$Cache = Get-Content -Path $CachePath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
 		$LastWriteTime = (Get-Item $CachePath).LastWriteTime.ToUniversalTime()
 	}
 	catch {
 		Write-Host "[WARNING] Cache file is unreadable or corrupted. Fetching new data." -ForegroundColor Yellow
-        Write-Host "$($_.Exception.GetType().Name)`n$($_.Exception.Message)" -ForegroundColor DarkGray
+		Write-Host "$($_.Exception.GetType().Name)`n$($_.Exception.Message)" -ForegroundColor DarkGray
 	}
 }
 
+# Calculate max lengths.
 $MaxVersionLength = 0
 foreach ($Version in $Versions) {
-    if ($Version.Length -gt $MaxVersionLength) {
-        $MaxVersionLength = $Version.Length
-    }
+	if ($Version.Length -gt $MaxVersionLength) {
+		$MaxVersionLength = $Version.Length
+	}
 }
-
 $MaxLoaderLength = 0
 foreach ($Loader in $Loaders) {
-    if ($Loader.Length -gt $MaxLoaderLength) {
+	if ($Loader.Length -gt $MaxLoaderLength) {
 		$MaxLoaderLength = $Loader.Length
 	}
 }
 
-$RequestCount = 0
-$TotalRequests = $Versions.Count * $Loaders.Count
-$CurrentTime = (Get-Date).ToUniversalTime()
-$TimeDifference = ($CurrentTime - $LastWriteTime).TotalHours
-
 # Fetch data from API.
-if ($TimeDifference -gt $ValidHours -or
-	-not $Data -or
-	$Data.Count -ne $Versions.Count -or
-	@($Data[0].Loaders.PSObject.Properties).Count -ne $Loaders.Count) {
-	$Data = [System.Collections.Generic.List[object]]::new()
+$CurrentTime = [DateTime]::UtcNow
+$TimeDifference = ($CurrentTime - $LastWriteTime).TotalHours
+if (
+	$MaxCacheHours -lt 0 -or
+	$TimeDifference -gt $MaxCacheHours -or
+	-not $Cache -or
+	$Cache.Count -ne $Versions.Count -or
+	@($Cache[0].Loaders.PSObject.Properties).Count -ne $Loaders.Count
+	){
+	$Fetch = [System.Collections.Generic.List[object]]::new()
+	$RequestCount = 0
+	$TotalRequests = $Versions.Count * $Loaders.Count
+	$Headers = @{"User-Agent" = "RobotB12/modrinth-stats/1.0 (https://github.com/RobotB12/modrinth-stats)"}
 	foreach ($Version in $Versions) {
 		$Stats = @{}
 		foreach ($Loader in $Loaders) {
@@ -66,42 +64,59 @@ if ($TimeDifference -gt $ValidHours -or
 			$RequestCount++
 			$Percentage = [math]::Round(($RequestCount / $TotalRequests) * 100)
 			try {
-				$Facets = "[[`"versions:$Version`"],[`"categories:$Loader`"]]"
-				$Url = "https://api.modrinth.com/v2/search?project_type=mod&facets=$Facets&limit=1"
-				$Response = Invoke-WebRequest -Uri $Url -Headers @{"User-Agent" = "b12robot/modrinth-stats/1.0 (https://github.com/b12robot/modrinth-stats)"} -UseBasicParsing -ErrorAction Stop
+				$Facets = [System.Uri]::EscapeDataString("[[`"versions:$Version`"],[`"categories:$Loader`"]]")
+				$Uri = "https://api.modrinth.com/v2/search?project_type=mod&facets=$Facets&limit=1"
+				$Response = Invoke-WebRequest -Uri $Uri -Headers $Headers -UseBasicParsing -ErrorAction Stop
 				$Hits = [int]($Response.Content | ConvertFrom-Json).total_hits
 				$Stats[$Loader] = $Hits
 				$Limit = [int]$Response.Headers["X-Ratelimit-Limit"]
 				$Remaining = [int]$Response.Headers["X-Ratelimit-Remaining"]
 				$Reset = [int]$Response.Headers["X-Ratelimit-Reset"]
+
 				Write-Host ("[INFO] [{0,3}/{1}] {2,3}% │ {3,-$MaxVersionLength} │ {4,-$MaxLoaderLength} -> {5,-6} │ Limit: {6,-4} │ Remaining: {7,-4} │ Reset: {8,-4}" -f $RequestCount, $TotalRequests, $Percentage, $Version, $Loader, $Hits, $Limit, $Remaining, $Reset) -ForegroundColor Cyan
+
+				if ($Remaining -le 1) {
+					Write-Host "[ERROR] Request limit almost full!" -ForegroundColor Red
+					Read-Host "Press Enter to exit..."
+					Exit 1
+				}
+
 				$Threshold = [math]::Max([int]($Limit * 0.1), 4)
-				if ($Remaining -lt $Threshold -and $Remaining -gt 0) {
-					$DynamicDelay = ($Reset / $Remaining) * 1000
-					$Delay = [Math]::Min(5000, [Math]::Max(1000, $DynamicDelay))
-					Write-Host "[WARNING] Rate limit exceeded! Dynamic delay: $Delay ms" -ForegroundColor Yellow
+				if ($Remaining -lt $Threshold) {
+					$Delay = ($Reset / $Remaining) * 1000
+					$Delay = [Math]::Min(5000, [Math]::Max(1000, $Delay))
+					Write-Host "[WARNING] Low remaining requests. Delay: $Delay ms" -ForegroundColor Yellow
 				}
 			}
 			catch {
+				if ($_.Exception.Response.StatusCode -eq 429) {
+					Write-Host "[ERROR] Rate limit exceeded! 429 Too Many Requests" -ForegroundColor Red
+					Read-Host "Press Enter to exit..."
+					Exit 1
+				}
+
 				$Stats[$Loader] = -1
 				Write-Host "[ERROR] Failed to fetch data -> Version: $Version | Loader: $Loader" -ForegroundColor Red
 				Write-Host "$($_.Exception.GetType().Name)`n$($_.Exception.Message)" -ForegroundColor DarkGray
 			}
 			Start-Sleep -Milliseconds $Delay
 		}
-		$Data.Add(
+
+		$Fetch.Add(
 			[PSCustomObject]@{
 				Version = $Version
 				Loaders = $Stats
 			}
 		)
 	}
+
 	try {
-		$Data | ConvertTo-Json -Depth 3 | Set-Content -Path $CachePath -Encoding UTF8 -ErrorAction Stop
-    }
+		$Fetch | ConvertTo-Json -Depth 3 | Set-Content -Path $CachePath -Encoding UTF8 -ErrorAction Stop
+		$Cache = $Fetch
+	}
 	catch {
 		Write-Host "[ERROR] Failed to save data to the cache file: $CachePath" -ForegroundColor Red
-        Write-Host "$($_.Exception.GetType().Name)`n$($_.Exception.Message)" -ForegroundColor DarkGray
+		Write-Host "$($_.Exception.GetType().Name)`n$($_.Exception.Message)" -ForegroundColor DarkGray
 		Read-Host "Press Enter to continue..."
 	}
 }
@@ -110,19 +125,19 @@ if ($TimeDifference -gt $ValidHours -or
 $GroupedData = @{}
 $MaxHitsLength = 0
 foreach ($Loader in $Loaders) {
-    $GroupedData[$Loader] = $(
-        foreach ($Item in $Data) {
-            [PSCustomObject]@{
-                Version = $Item.Version
-                Hits = [int]$Item.Loaders.$Loader
-            }
-        }
-    ) | Sort-Object -Property Hits -Descending
+	$GroupedData[$Loader] = $(
+		foreach ($Item in $Cache) {
+			[PSCustomObject]@{
+				Version = $Item.Version
+				Hits = [int]$Item.Loaders.$Loader
+			}
+		}
+	) | Sort-Object -Property Hits -Descending
 
-    $CurrentLength = ([string]$GroupedData[$Loader][0].Hits).Length
-    if ($CurrentLength -gt $MaxHitsLength) {
-        $MaxHitsLength = $CurrentLength
-    }
+	$CurrentLength = ([string]$GroupedData[$Loader][0].Hits).Length
+	if ($CurrentLength -gt $MaxHitsLength) {
+		$MaxHitsLength = $CurrentLength
+	}
 }
 
 # Calculate table layout.
@@ -132,14 +147,14 @@ $TopBorder = "╔" + ($Segments -join "╦") + "╗"
 $MidBorder = "╠" + ($Segments -join "╬") + "╣"
 $BotBorder = "╚" + ($Segments -join "╩") + "╝"
 
-# Calculate percentage.
+# Calculate stats percentage.
 $AllHits = $(
-    foreach ($Item in $Data) {
-        foreach ($Loader in $Loaders) {
-            $Value = [int]$Item.Loaders.$Loader
-            if ($Value -ge 0) { $Value }
-        }
-    }
+	foreach ($Item in $Cache) {
+		foreach ($Loader in $Loaders) {
+			$Value = [int]$Item.Loaders.$Loader
+			if ($Value -ge 0) { $Value }
+		}
+	}
 ) | Sort-Object
 
 if ($AllHits.Count -gt 0) {
@@ -176,20 +191,20 @@ Write-Host "$ColorTitle MODRINTH MOD VERSION STATISTICS $ColorDefault"
 Write-Host "$ColorBorder$TopBorder$ColorDefault"
 
 $HeaderArray = foreach ($Loader in $Loaders) {
-    $Title = " " + $Loader.Substring(0,1).ToUpper() + $Loader.Substring(1)
-    $Title.PadRight($ColumnWidth)
+	$Title = " " + $Loader.Substring(0,1).ToUpper() + $Loader.Substring(1)
+	$Title.PadRight($ColumnWidth)
 }
 $HeaderString = $HeaderArray -join "$ColorBorder║$ColorHeader"
 
 Write-Host "$ColorBorder║$ColorHeader$HeaderString$ColorBorder║$ColorDefault"
 Write-Host "$ColorBorder$MidBorder$ColorDefault"
 
-for ($RowIndex = 0; $RowIndex -lt $Data.Count; $RowIndex++) {
-    $ColorZebra = if ($RowIndex % 2) { $ColorRow } else { "" }
-    $RowOutput = foreach ($Loader in $Loaders) {
-        $CellData = $GroupedData[$Loader][$RowIndex]
+for ($RowIndex = 0; $RowIndex -lt $Cache.Count; $RowIndex++) {
+	$ColorZebra = if ($RowIndex % 2) { $ColorRow } else { "" }
+	$RowOutput = foreach ($Loader in $Loaders) {
+		$CellData = $GroupedData[$Loader][$RowIndex]
 		$Hit = [int]$CellData.Hits
-		if ($Hit -lt 0) {
+		if ($Hit -lt 1) {
 			$ColorHit = $ColorError
 			$DisplayHit = "NA"
 		}
@@ -203,12 +218,12 @@ for ($RowIndex = 0; $RowIndex -lt $Data.Count; $RowIndex++) {
 		}
 		$VersionText = "{0,-$MaxVersionLength}" -f $CellData.Version
 		$HitsText = "{0,$MaxHitsLength}" -f $DisplayHit
-        " $ColorVersion$VersionText $ColorArrow-> $ColorHit$HitsText$ColorDefault "
-    }
+		" $ColorVersion$VersionText $ColorArrow-> $ColorHit$HitsText$ColorDefault "
+	}
 	$RowText = $RowOutput -join "$ColorBorder║"
 	Write-Host "$ColorZebra$ColorBorder║$RowText$ColorBorder║$AllDefault"
 }
 
 Write-Host "$ColorBorder$BotBorder$ColorDefault"
 Read-Host "Press Enter to exit..."
-Exit
+Exit 0
